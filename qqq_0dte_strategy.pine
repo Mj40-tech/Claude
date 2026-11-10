@@ -1,0 +1,550 @@
+//@version=6
+// ══════════════════════════════════════════════════════════════════════════════
+//  QQQ 0DTE Options Day Trader
+// ──────────────────────────────────────────────────────────────────────────────
+//  Intraday strategy for buying same-day-expiry (0DTE) QQQ calls and puts.
+//
+//    Bullish setup  ->  BUY a 0DTE call   (back-tested as a long  on QQQ)
+//    Bearish setup  ->  BUY a 0DTE put    (back-tested as a short on QQQ)
+//
+//  HOW IT TRADES
+//    1. Bias     - price vs. session VWAP, fast/slow EMA, higher-timeframe EMA.
+//    2. Trigger  - opening-range breakout, or a pullback that reclaims the fast EMA.
+//    3. Exit     - ATR stop and R-multiple target on the QQQ price, breakeven and
+//                  optional trailing stop, VWAP-loss exit, time stop, and a hard
+//                  end-of-day flatten so nothing is held into expiration.
+//    4. Limits   - entry window, max trades per day, max losses per day, cooldown.
+//
+//  READ THIS FIRST - WHAT TRADINGVIEW CAN AND CANNOT DO
+//    * Pine Script has no option-chain data and cannot send option orders. The
+//      script trades the QQQ chart and MODELS the option with Black-Scholes
+//      (strike, premium, delta) using a volatility index (VXN) as the IV input.
+//    * Strategy Tester numbers are delta-equivalent QQQ shares. The on-chart
+//      dashboard shows the modeled option P&L (includes theta and gamma). Both
+//      are estimates: real fills, spreads and implied volatility will differ.
+//    * Use it on QQQ, regular trading hours, on a 1- to 5-minute chart.
+//    * Alerts: create an alert on this strategy, choose "Order fills only" and
+//      set the message to  {{strategy.order.alert_message}}
+//    * Educational tool, not financial advice. 0DTE options can lose their whole
+//      value in minutes.
+// ══════════════════════════════════════════════════════════════════════════════
+strategy("QQQ 0DTE Options Day Trader", shorttitle = "QQQ 0DTE", overlay = true,
+     initial_capital = 25000, currency = currency.USD,
+     default_qty_type = strategy.fixed, default_qty_value = 50, pyramiding = 0,
+     process_orders_on_close = true, calc_on_every_tick = false,
+     slippage = 1, commission_type = strategy.commission.cash_per_order, commission_value = 0,
+     margin_long = 0, margin_short = 0, max_labels_count = 500)
+
+// ── Constants ────────────────────────────────────────────────────────────────
+const string TZ        = "America/New_York"
+const int    RTH_OPEN  = 570             // 09:30 ET, minutes after midnight
+const int    RTH_CLOSE = 960             // 16:00 ET
+const float  YEAR_MIN  = 252.0 * 390.0   // trading minutes in a year (IV is annualised)
+const string ID_CALL   = "CALL"
+const string ID_PUT    = "PUT"
+const string X_CALL    = "CALL exit"
+const string X_PUT     = "PUT exit"
+const string DIR_BOTH  = "Calls & puts"
+const string DIR_CALLS = "Calls only"
+const string DIR_PUTS  = "Puts only"
+const string IV_LIVE   = "Volatility index (live)"
+const string IV_PREV   = "Volatility index (prior close)"
+const string IV_MANUAL = "Manual"
+const string SIZE_FIX  = "Fixed contracts"
+const string SIZE_RISK = "Risk-based"
+const color  C_BULL    = #26a69a
+const color  C_BEAR    = #ef5350
+const color  C_WARN    = #f59f00
+
+// ── Inputs ───────────────────────────────────────────────────────────────────
+const string G_SETUP = "1 · Setups"
+string dirMode    = input.string(DIR_BOTH, "Trade direction", options = [DIR_BOTH, DIR_CALLS, DIR_PUTS], group = G_SETUP)
+bool   useOrb     = input.bool(true, "Opening-range breakout (ORB)", group = G_SETUP, tooltip = "Buy calls when a bar closes above the opening-range high, puts when it closes below the low. One ORB trade per direction per day.")
+int    orMinutes  = input.int(15, "Opening range length (minutes)", minval = 1, maxval = 120, group = G_SETUP, tooltip = "Measured from 09:30 New York time. Must be at least one chart bar long.")
+bool   useRelVol  = input.bool(true, "ORB needs relative volume ≥", inline = "rv", group = G_SETUP)
+float  relVolMin  = input.float(1.2, "", minval = 0.1, step = 0.1, inline = "rv", group = G_SETUP, tooltip = "Breakout bar volume divided by the 20-bar average volume.")
+bool   usePb      = input.bool(true, "Trend pullback (fast-EMA reclaim)", group = G_SETUP, tooltip = "In an established trend, enter when price dips to the fast EMA and then closes back through the prior bar's high (calls) or low (puts).")
+int    pbLookback = input.int(3, "Pullback: max bars since EMA touch", minval = 0, maxval = 20, group = G_SETUP)
+
+const string G_TIME = "2 · Session & timing (New York time)"
+int  entryStartH = input.int(9,  "First entry at", minval = 0, maxval = 23, inline = "t1", group = G_TIME)
+int  entryStartM = input.int(45, ":", minval = 0, maxval = 59, inline = "t1", group = G_TIME, tooltip = "No entries before this time. Entries are decided when a bar closes.")
+int  entryEndH   = input.int(14, "Last entry at", minval = 0, maxval = 23, inline = "t2", group = G_TIME)
+int  entryEndM   = input.int(45, ":", minval = 0, maxval = 59, inline = "t2", group = G_TIME, tooltip = "No new entries after this time. Late-day 0DTE premium decays extremely fast.")
+int  flatH       = input.int(15, "Force flat at", minval = 0, maxval = 23, inline = "t3", group = G_TIME)
+int  flatM       = input.int(30, ":", minval = 0, maxval = 59, inline = "t3", group = G_TIME, tooltip = "Any open position is closed at the close of the bar that ends at this time. Many brokers start auto-closing expiring options between 15:30 and 15:50 ET, so keep this before your broker's cut-off.")
+bool skipLunch   = input.bool(true, "Skip midday chop", group = G_TIME, tooltip = "Blocks new entries during the window below. Open positions are still managed.")
+int  lunchStartH = input.int(11, "Midday pause from", minval = 0, maxval = 23, inline = "t4", group = G_TIME)
+int  lunchStartM = input.int(30, ":", minval = 0, maxval = 59, inline = "t4", group = G_TIME)
+int  lunchEndH   = input.int(13, "Midday pause until", minval = 0, maxval = 23, inline = "t5", group = G_TIME)
+int  lunchEndM   = input.int(0,  ":", minval = 0, maxval = 59, inline = "t5", group = G_TIME)
+bool tradeMon    = input.bool(true, "Mon", inline = "dow", group = G_TIME)
+bool tradeTue    = input.bool(true, "Tue", inline = "dow", group = G_TIME)
+bool tradeWed    = input.bool(true, "Wed", inline = "dow", group = G_TIME)
+bool tradeThu    = input.bool(true, "Thu", inline = "dow", group = G_TIME)
+bool tradeFri    = input.bool(true, "Fri", inline = "dow", group = G_TIME)
+
+const string G_FILT = "3 · Trend & filters"
+int    emaFastLen = input.int(9,  "Fast EMA", minval = 2, group = G_FILT)
+int    emaSlowLen = input.int(21, "Slow EMA", minval = 3, group = G_FILT)
+bool   useHtf     = input.bool(true, "Higher-timeframe trend filter", group = G_FILT, tooltip = "Calls only above the higher-timeframe EMA, puts only below it. Uses the last completed higher-timeframe bar, so it does not repaint.")
+string htfTf      = input.timeframe("15", "Higher timeframe", group = G_FILT)
+int    htfLen     = input.int(20, "Higher-timeframe EMA length", minval = 2, group = G_FILT)
+bool   useAdx     = input.bool(true, "Pullback needs ADX ≥", inline = "adx", group = G_FILT)
+float  adxMin     = input.float(20.0, "", minval = 0.0, step = 1.0, inline = "adx", group = G_FILT)
+int    adxLen     = input.int(14, "ADX length", minval = 2, group = G_FILT)
+bool   useRsi     = input.bool(true, "Pullback RSI filter, max RSI for calls", inline = "rsi", group = G_FILT)
+float  rsiMax     = input.float(75.0, "", minval = 51.0, maxval = 100.0, step = 1.0, inline = "rsi", group = G_FILT, tooltip = "Calls need RSI between 50 and this value. Puts use the mirror image (between 100 minus this value and 50).")
+int    rsiLen     = input.int(14, "RSI length", minval = 2, group = G_FILT)
+
+const string G_RISK = "4 · Stops, targets & exits (on the QQQ price)"
+int   atrLen      = input.int(14, "ATR length", minval = 1, group = G_RISK)
+float stopAtr     = input.float(1.5, "Stop distance (× ATR)", minval = 0.1, step = 0.1, group = G_RISK)
+float minStopPct  = input.float(0.10, "Minimum stop distance (% of price)", minval = 0.0, step = 0.01, group = G_RISK, tooltip = "Keeps the stop from being placed inside normal noise when ATR is tiny.")
+float rrTarget    = input.float(2.0, "Profit target (× risk, 0 = none)", minval = 0.0, step = 0.25, group = G_RISK)
+bool  useBe       = input.bool(true, "Move stop to breakeven after gain of (× risk)", inline = "be", group = G_RISK)
+float beR         = input.float(1.0, "", minval = 0.1, step = 0.1, inline = "be", group = G_RISK)
+bool  useTrail    = input.bool(false, "Trail stop after gain of (× risk)", inline = "tr", group = G_RISK)
+float trailStartR = input.float(1.0, "", minval = 0.0, step = 0.1, inline = "tr", group = G_RISK)
+float trailAtr    = input.float(2.0, "Trail distance (× ATR)", minval = 0.1, step = 0.1, group = G_RISK)
+bool  exitOnVwap  = input.bool(true, "Exit when a bar closes on the wrong side of VWAP", group = G_RISK)
+int   maxHoldMin  = input.int(90, "Time stop (minutes in trade, 0 = off)", minval = 0, group = G_RISK, tooltip = "0DTE premium bleeds every minute. If the move has not happened by now, get out.")
+
+const string G_DAY = "5 · Daily limits"
+int   maxTrades     = input.int(3, "Max trades per day", minval = 1, group = G_DAY)
+int   maxLosses     = input.int(2, "Stop for the day after this many losses", minval = 1, group = G_DAY)
+float dayLossLimit  = input.float(0.0, "Daily loss limit ($, modeled option P&L, 0 = off)", minval = 0.0, step = 50.0, group = G_DAY)
+float dayProfitLock = input.float(0.0, "Daily profit lock ($, modeled option P&L, 0 = off)", minval = 0.0, step = 50.0, group = G_DAY)
+int   cooldownBars  = input.int(3, "Bars to wait after an exit", minval = 0, group = G_DAY)
+
+const string G_OPT = "6 · 0DTE option model"
+float  strikeStep   = input.float(1.0, "Strike spacing ($)", minval = 0.5, step = 0.5, group = G_OPT)
+int    strikeOffset = input.int(0, "Strike offset (0 = ATM, + = OTM, − = ITM)", minval = -10, maxval = 10, group = G_OPT, tooltip = "Number of strikes away from the at-the-money strike. +1 buys one strike out of the money, −1 buys one strike in the money.")
+string ivSource     = input.string(IV_LIVE, "Implied volatility source", options = [IV_LIVE, IV_PREV, IV_MANUAL], group = G_OPT)
+string volSymbol    = input.symbol("CBOE:VXN", "Volatility index", group = G_OPT, tooltip = "VXN is the Nasdaq-100 volatility index. Falls back to the manual IV if the symbol has no data.")
+float  ivMult       = input.float(0.85, "IV multiplier", minval = 0.1, maxval = 5.0, step = 0.05, group = G_OPT, tooltip = "Calibration knob. Compare the dashboard's ATM premium with your broker's option chain and nudge this until they match. Raise it on event days (CPI, FOMC).")
+float  manualIv     = input.float(20.0, "Manual IV (%)", minval = 1.0, maxval = 300.0, step = 0.5, group = G_OPT)
+float  minPrem      = input.float(0.20, "Skip trades when premium is below ($)", minval = 0.0, step = 0.05, group = G_OPT)
+float  optSlip      = input.float(0.02, "Option slippage per side ($ per share)", minval = 0.0, step = 0.01, group = G_OPT, tooltip = "Half the bid/ask spread you expect to give up on each fill.")
+float  optComm      = input.float(0.65, "Option commission per contract, per side ($)", minval = 0.0, step = 0.05, group = G_OPT)
+
+const string G_SIZE = "7 · Position sizing"
+string sizeMode       = input.string(SIZE_FIX, "Sizing", options = [SIZE_FIX, SIZE_RISK], group = G_SIZE)
+int    fixedContracts = input.int(1, "Contracts (fixed sizing)", minval = 1, group = G_SIZE)
+float  riskUsd        = input.float(250.0, "Risk per trade ($, risk-based sizing)", minval = 1.0, step = 25.0, group = G_SIZE, tooltip = "Contracts = this amount divided by the modeled loss per contract if the stop is hit. Always trades at least 1 contract.")
+int    maxContracts   = input.int(10, "Max contracts (risk-based sizing)", minval = 1, group = G_SIZE)
+
+const string G_VIS = "8 · Visuals"
+bool   showTable  = input.bool(true, "Dashboard", inline = "tb", group = G_VIS)
+string tablePos   = input.string("Top right", "", options = ["Top right", "Top left", "Bottom right", "Bottom left"], inline = "tb", group = G_VIS)
+bool   showLabels = input.bool(true, "Trade labels", group = G_VIS)
+bool   showLevels = input.bool(true, "Opening range, stop and target lines", group = G_VIS)
+bool   showShade  = input.bool(true, "Shade entry window and forced-flat zone", group = G_VIS)
+
+// ── Types ────────────────────────────────────────────────────────────────────
+// The option position currently being modeled.
+type OptTrade
+    bool   active        = false
+    bool   isCall        = true
+    string tag           = ""
+    float  strike        = na
+    int    contracts     = 0
+    float  entryPrem     = na    // modeled premium paid, per share, slippage included
+    float  entryPx       = na    // QQQ price at entry
+    float  riskPx        = na    // initial stop distance on QQQ (1R)
+    float  stopPx        = na
+    float  targetPx      = na
+    float  bestPx        = na    // most favourable QQQ price since entry
+    int    entryTime     = na
+    int    closedAtEntry = 0     // strategy.closedtrades when the entry was sent
+
+// Running totals of the modeled option P&L.
+type Stats
+    float totalPnl    = 0.0
+    float grossWin    = 0.0
+    float grossLoss   = 0.0
+    int   wins        = 0
+    int   losses      = 0
+    float dayPnl      = 0.0
+    int   dayTrades   = 0
+    int   dayLosses   = 0
+    int   lastExitBar = na
+
+// ── Functions ────────────────────────────────────────────────────────────────
+f_px(float x)     => str.tostring(x, format.mintick)
+f_prem(float x)   => "$" + str.tostring(x, "0.00")
+f_strike(float k) => str.tostring(k, "0.##")
+f_usd(float x)    => (x < 0 ? "-$" : "+$") + str.tostring(math.abs(x), "0")
+
+// Standard normal CDF (Abramowitz & Stegun 26.2.17, absolute error < 7.5e-8).
+f_cdf(float x) =>
+    float ax   = math.abs(x)
+    float k    = 1.0 / (1.0 + 0.2316419 * ax)
+    float poly = k * (0.319381530 + k * (-0.356563782 + k * (1.781477937 + k * (-1.821255978 + k * 1.330274429))))
+    float tail = 0.3989422804014327 * math.exp(-0.5 * ax * ax) * poly
+    x >= 0.0 ? 1.0 - tail : tail
+
+// Black-Scholes value and delta with zero rates and dividends, which is accurate
+// enough for an option with only hours to live. Returns [price, delta].
+f_bs(bool isCall, float s, float k, float tYears, float vol) =>
+    float price = na
+    float delta = na
+    if not na(s) and not na(k) and s > 0.0 and k > 0.0
+        float sd = na(vol) or na(tYears) ? 0.0 : vol * math.sqrt(math.max(tYears, 0.0))
+        if sd <= 1e-9
+            price := isCall ? math.max(s - k, 0.0) : math.max(k - s, 0.0)
+            delta := isCall ? (s > k ? 1.0 : 0.0) : (s < k ? -1.0 : 0.0)
+        else
+            float d1 = (math.log(s / k) + 0.5 * sd * sd) / sd
+            float d2 = d1 - sd
+            if isCall
+                price := s * f_cdf(d1) - k * f_cdf(d2)
+                delta := f_cdf(d1)
+            else
+                price := k * f_cdf(-d2) - s * f_cdf(-d1)
+                delta := f_cdf(d1) - 1.0
+    [price, delta]
+
+f_bsPrice(bool isCall, float s, float k, float tYears, float vol) =>
+    [bsPrice, bsDelta] = f_bs(isCall, s, k, tYears, vol)
+    bsPrice
+
+// Books a finished option trade into the running totals and frees the slot.
+// Returns [premium received per share after slippage, P&L in dollars].
+f_settle(OptTrade t, Stats s, float rawExitPrem) =>
+    float exitPrem = math.max(nz(rawExitPrem) - optSlip, 0.0)
+    float sides    = exitPrem > 0.0 ? 2.0 : 1.0    // nothing to sell if it is worthless
+    float pnl      = (exitPrem - t.entryPrem) * 100.0 * t.contracts - sides * optComm * t.contracts
+    s.totalPnl += pnl
+    s.dayPnl   += pnl
+    if pnl > 0.0
+        s.wins     += 1
+        s.grossWin += pnl
+    else
+        s.losses    += 1
+        s.dayLosses += 1
+        s.grossLoss -= pnl
+    s.lastExitBar := bar_index
+    t.active      := false
+    [exitPrem, pnl]
+
+f_exitLabel(OptTrade t, string why, float exitPrem, float pnl) =>
+    if showLabels
+        float  pct = t.entryPrem > 0.0 ? (exitPrem - t.entryPrem) / t.entryPrem * 100.0 : 0.0
+        string txt = "SELL " + t.tag + " · " + why + "\n≈ " + f_prem(exitPrem) + " (" + (pct >= 0.0 ? "+" : "") + str.tostring(pct, "0") + "%) · " + f_usd(pnl)
+        label.new(bar_index, t.isCall ? high : low, txt,
+             style = t.isCall ? label.style_label_down : label.style_label_up,
+             color = pnl > 0.0 ? color.new(C_BULL, 10) : color.new(C_BEAR, 10),
+             textcolor = color.white, size = size.small)
+
+f_cell(table tb, int row, string name, string value, color valueColor) =>
+    table.cell(tb, 0, row, name, text_color = color.new(chart.fg_color, 35), text_halign = text.align_left, text_size = size.small)
+    table.cell(tb, 1, row, value, text_color = valueColor, text_halign = text.align_right, text_size = size.small)
+
+// ── Guards ───────────────────────────────────────────────────────────────────
+if not timeframe.isintraday
+    runtime.error("QQQ 0DTE: use an intraday chart (1- to 5-minute bars recommended).")
+
+// ── 1. Clock (New York time) ─────────────────────────────────────────────────
+int   openMin  = hour(time, TZ) * 60 + minute(time, TZ)
+int   closeMin = hour(time_close, TZ) * 60 + minute(time_close, TZ)
+bool  inRth    = openMin >= RTH_OPEN and openMin < RTH_CLOSE
+bool  newDate  = timeframe.change("D")
+bool  rthStart = inRth and (not inRth[1] or newDate)
+
+int   expiryTs = timestamp(TZ, year(time, TZ), month(time, TZ), dayofmonth(time, TZ), 16, 0, 0)
+float minsLeft = math.max((expiryTs - time_close) / 60000.0, 0.0)
+float tYears   = minsLeft / YEAR_MIN      // time to expiry at this bar's close
+float barMins  = timeframe.in_seconds() / 60.0
+
+int  entryStartMin = entryStartH * 60 + entryStartM
+int  entryEndMin   = entryEndH * 60 + entryEndM
+int  flatMin       = flatH * 60 + flatM
+int  lunchStartMin = lunchStartH * 60 + lunchStartM
+int  lunchEndMin   = lunchEndH * 60 + lunchEndM
+
+bool inEntryWin = inRth and closeMin >= entryStartMin and closeMin <= entryEndMin and closeMin < flatMin
+bool inLunch    = skipLunch and closeMin > lunchStartMin and closeMin <= lunchEndMin
+bool flatNow    = not inRth or closeMin >= flatMin or session.islastbar_regular
+int  dow        = dayofweek(time, TZ)
+bool dowOk      = switch dow
+    dayofweek.monday    => tradeMon
+    dayofweek.tuesday   => tradeTue
+    dayofweek.wednesday => tradeWed
+    dayofweek.thursday  => tradeThu
+    dayofweek.friday    => tradeFri
+    => false
+
+// ── 2. Indicators ────────────────────────────────────────────────────────────
+float emaFast = ta.ema(close, emaFastLen)
+float emaSlow = ta.ema(close, emaSlowLen)
+float atrVal  = ta.atr(atrLen)
+float rsiVal  = ta.rsi(close, rsiLen)
+[diPlus, diMinus, adxVal] = ta.dmi(adxLen, adxLen)
+float volAvg  = ta.sma(volume, 20)
+float relVol  = volAvg > 0.0 ? volume / volAvg : 0.0
+float vwapVal = ta.vwap(hlc3, rthStart)       // VWAP anchored to the 09:30 open
+float htfEma  = request.security(syminfo.tickerid, htfTf, ta.ema(close, htfLen)[1], lookahead = barmerge.lookahead_on)
+int   barsSinceTouchUp = ta.barssince(low <= emaFast)
+int   barsSinceTouchDn = ta.barssince(high >= emaFast)
+
+// ── 3. Opening range ─────────────────────────────────────────────────────────
+var float orHigh = na
+var float orLow  = na
+var bool  orDone = false
+var bool  dayOk  = false      // true when the session was seen from its 09:30 bar
+int orEndMin = RTH_OPEN + orMinutes
+if rthStart
+    orHigh := na
+    orLow  := na
+    orDone := false
+    dayOk  := openMin == RTH_OPEN
+if inRth and dayOk and not orDone
+    if closeMin <= orEndMin
+        orHigh := na(orHigh) ? high : math.max(orHigh, high)
+        orLow  := na(orLow) ? low : math.min(orLow, low)
+    if closeMin >= orEndMin
+        orDone := not na(orHigh)
+
+// ── 4. Option snapshot (what a 0DTE call / put should cost right now) ────────
+float volLive  = request.security(volSymbol, timeframe.period, close, ignore_invalid_symbol = true)
+float volPrev  = request.security(volSymbol, "D", close[1], lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+float volIndex = switch ivSource
+    IV_LIVE => nz(volLive, nz(volPrev, manualIv))
+    IV_PREV => nz(volPrev, manualIv)
+    => manualIv
+float iv = math.max(volIndex * ivMult, 1.0) / 100.0
+
+float atmStrike = math.round(close / strikeStep) * strikeStep
+float kCall     = atmStrike + strikeOffset * strikeStep
+float kPut      = atmStrike - strikeOffset * strikeStep
+[callPrem, callDelta] = f_bs(true, close, kCall, tYears, iv)
+[putPrem, putDelta]   = f_bs(false, close, kPut, tYears, iv)
+
+// ── 5. Book-keeping for the open trade ───────────────────────────────────────
+var OptTrade ot = OptTrade.new()
+var Stats    st = Stats.new()
+var bool orbLongUsed  = false
+var bool orbShortUsed = false
+
+// 5a. Fail-safe: a position that survives into a new calendar day has expired.
+//     The end-of-day flatten should always prevent this.
+bool expiredNow = false
+if newDate and ot.active
+    float expRaw = f_bsPrice(ot.isCall, close[1], ot.strike, 0.0, iv)
+    [expPrem, expPnl] = f_settle(ot, st, expRaw + optSlip)    // settles at intrinsic value, no spread
+    f_exitLabel(ot, "Expired", expPrem, expPnl)
+    strategy.cancel_all()
+    strategy.close_all(comment = "Expired", alert_message = "QQQ 0DTE | position was still open at expiration - check your account")
+    expiredNow := true
+
+// 5b. Stop or target filled by the broker emulator inside this bar.
+if ot.active and strategy.position_size == 0
+    if strategy.closedtrades > ot.closedAtEntry
+        float  xPx    = strategy.closedtrades.exit_price(strategy.closedtrades - 1)
+        bool   isTgt  = not na(ot.targetPx) and (ot.isCall ? xPx >= ot.targetPx : xPx <= ot.targetPx)
+        bool   isProt = ot.isCall ? ot.stopPx >= ot.entryPx : ot.stopPx <= ot.entryPx
+        string why    = isTgt ? "Target" : isProt ? "Protected stop" : "Stop"
+        // The fill happened somewhere inside the bar: price the option at mid-bar.
+        float  xRaw   = f_bsPrice(ot.isCall, xPx, ot.strike, tYears + 0.5 * barMins / YEAR_MIN, iv)
+        [xPrem, xPnl] = f_settle(ot, st, xRaw)
+        f_exitLabel(ot, why, xPrem, xPnl)
+    else
+        // The entry order never filled: forget it.
+        ot.active    := false
+        st.dayTrades -= 1
+        strategy.cancel_all()
+
+// 5c. New regular session: reset the daily counters.
+if rthStart
+    st.dayPnl    := 0.0
+    st.dayTrades := 0
+    st.dayLosses := 0
+    orbLongUsed  := false
+    orbShortUsed := false
+
+// 5d. Fail-safe: a position without a modeled trade behind it is closed.
+if strategy.position_size != 0 and not ot.active and not expiredNow and barstate.isconfirmed
+    strategy.close_all(comment = "Safety flat", alert_message = "QQQ 0DTE | safety flatten - close any open option position")
+
+// ── 6. Signals ───────────────────────────────────────────────────────────────
+bool htfUp     = not useHtf or (not na(htfEma) and close > htfEma)
+bool htfDn     = not useHtf or (not na(htfEma) and close < htfEma)
+bool biasLong  = close > vwapVal and emaFast > emaSlow and htfUp
+bool biasShort = close < vwapVal and emaFast < emaSlow and htfDn
+bool adxOk     = not useAdx or adxVal >= adxMin
+bool volOk     = not useRelVol or relVol >= relVolMin
+bool rsiOkLong  = not useRsi or (rsiVal > 50.0 and rsiVal < rsiMax)
+bool rsiOkShort = not useRsi or (rsiVal < 50.0 and rsiVal > 100.0 - rsiMax)
+
+bool orbUp    = useOrb and orDone and close > orHigh and close[1] <= orHigh
+bool orbDn    = useOrb and orDone and close < orLow and close[1] >= orLow
+bool orbLong  = orbUp and biasLong and volOk and not orbLongUsed
+bool orbShort = orbDn and biasShort and volOk and not orbShortUsed
+
+bool pbLong  = usePb and biasLong and adxOk and rsiOkLong and barsSinceTouchUp <= pbLookback and
+     close > emaFast and close > open and close > high[1]
+bool pbShort = usePb and biasShort and adxOk and rsiOkShort and barsSinceTouchDn <= pbLookback and
+     close < emaFast and close < open and close < low[1]
+
+bool allowCalls = dirMode != DIR_PUTS
+bool allowPuts  = dirMode != DIR_CALLS
+bool limitsOk   = st.dayTrades < maxTrades and st.dayLosses < maxLosses and
+     (dayLossLimit <= 0.0 or st.dayPnl > -dayLossLimit) and
+     (dayProfitLock <= 0.0 or st.dayPnl < dayProfitLock)
+bool cooldownOk = na(st.lastExitBar) or bar_index - st.lastExitBar >= cooldownBars
+bool canEnter   = barstate.isconfirmed and strategy.position_size == 0 and not ot.active and dayOk and
+     inEntryWin and not inLunch and dowOk and limitsOk and cooldownOk and not na(atrVal)
+
+bool goCall = canEnter and allowCalls and (orbLong or pbLong) and callPrem >= minPrem
+bool goPut  = canEnter and allowPuts and (orbShort or pbShort) and putPrem >= minPrem and not goCall
+
+// ── 7. Manage the open trade ─────────────────────────────────────────────────
+if ot.active and strategy.position_size != 0
+    // Ratchet the stop: breakeven first, then the optional ATR trail.
+    ot.bestPx := ot.isCall ? math.max(ot.bestPx, high) : math.min(ot.bestPx, low)
+    float bestR = (ot.isCall ? ot.bestPx - ot.entryPx : ot.entryPx - ot.bestPx) / ot.riskPx
+    if useBe and bestR >= beR
+        ot.stopPx := ot.isCall ? math.max(ot.stopPx, ot.entryPx) : math.min(ot.stopPx, ot.entryPx)
+    if useTrail and bestR >= trailStartR
+        float trailPx = math.round_to_mintick(ot.isCall ? ot.bestPx - trailAtr * atrVal : ot.bestPx + trailAtr * atrVal)
+        ot.stopPx := ot.isCall ? math.max(ot.stopPx, trailPx) : math.min(ot.stopPx, trailPx)
+
+    // Exits decided at the bar close.
+    float  heldMin = (time_close - ot.entryTime) / 60000.0
+    string why     = na
+    if flatNow
+        why := "End of day"
+    else if exitOnVwap and (ot.isCall ? close < vwapVal : close > vwapVal)
+        why := "VWAP lost"
+    else if maxHoldMin > 0 and heldMin >= maxHoldMin
+        why := "Time stop"
+
+    if not na(why) and barstate.isconfirmed
+        float mRaw = f_bsPrice(ot.isCall, close, ot.strike, tYears, iv)
+        strategy.close(ot.isCall ? ID_CALL : ID_PUT, comment = why,
+             alert_message = "QQQ 0DTE | SELL TO CLOSE " + ot.tag + " | " + why + " | QQQ " + f_px(close) + " | est. premium " + f_prem(mRaw))
+        [mPrem, mPnl] = f_settle(ot, st, mRaw)
+        f_exitLabel(ot, why, mPrem, mPnl)
+    else
+        // Keep the stop / target working orders in sync with the ratcheted stop.
+        strategy.exit(ot.isCall ? X_CALL : X_PUT, from_entry = ot.isCall ? ID_CALL : ID_PUT,
+             stop = ot.stopPx, limit = ot.targetPx, comment_loss = "Stop", comment_profit = "Target",
+             alert_loss = "QQQ 0DTE | SELL TO CLOSE " + ot.tag + " | stop hit at QQQ " + f_px(ot.stopPx),
+             alert_profit = "QQQ 0DTE | SELL TO CLOSE " + ot.tag + " | target hit at QQQ " + f_px(ot.targetPx))
+
+// ── 8. Entries ───────────────────────────────────────────────────────────────
+if goCall or goPut
+    bool   isCall = goCall
+    bool   isOrb  = isCall ? orbLong : orbShort
+    string setup  = isOrb ? "ORB" : "Pullback"
+    float  strike = isCall ? kCall : kPut
+    float  prem   = isCall ? callPrem : putPrem
+    float  delta  = isCall ? callDelta : putDelta
+
+    // Stop and target on the QQQ price.
+    float dist = math.max(atrVal * stopAtr, close * minStopPct / 100.0, syminfo.mintick * 2)
+    float stp  = math.round_to_mintick(isCall ? close - dist : close + dist)
+    float tgt  = rrTarget > 0.0 ? math.round_to_mintick(isCall ? close + dist * rrTarget : close - dist * rrTarget) : na
+
+    // What the option should be worth at those levels (same time, same IV).
+    float premStop  = f_bsPrice(isCall, stp, strike, tYears, iv)
+    float premTgt   = na(tgt) ? na : f_bsPrice(isCall, tgt, strike, tYears, iv)
+    float entryPrem = prem + optSlip
+
+    // Size the trade.
+    float riskPerContract = math.max(entryPrem - premStop + optSlip, 0.01) * 100.0 + 2.0 * optComm
+    int   contracts = sizeMode == SIZE_FIX ? fixedContracts : math.max(1, math.min(maxContracts, math.floor(riskUsd / riskPerContract)))
+    float shares    = math.max(1.0, math.round(contracts * 100.0 * math.abs(delta)))
+
+    string tag = str.tostring(contracts) + "x " + f_strike(strike) + (isCall ? "C" : "P")
+    string msg = "QQQ 0DTE | BUY TO OPEN " + tag + " expiring today | " + setup + " | QQQ " + f_px(close) +
+         " | est. premium " + f_prem(prem) + " | stop QQQ " + f_px(stp) + " (est. premium " + f_prem(premStop) + ")" +
+         (na(tgt) ? "" : " | target QQQ " + f_px(tgt) + " (est. premium " + f_prem(premTgt) + ")")
+
+    strategy.entry(isCall ? ID_CALL : ID_PUT, isCall ? strategy.long : strategy.short, qty = shares,
+         comment = (isCall ? "Call " : "Put ") + setup, alert_message = msg)
+    strategy.exit(isCall ? X_CALL : X_PUT, from_entry = isCall ? ID_CALL : ID_PUT,
+         stop = stp, limit = tgt, comment_loss = "Stop", comment_profit = "Target",
+         alert_loss = "QQQ 0DTE | SELL TO CLOSE " + tag + " | stop hit at QQQ " + f_px(stp),
+         alert_profit = "QQQ 0DTE | SELL TO CLOSE " + tag + " | target hit at QQQ " + f_px(tgt))
+
+    ot.active        := true
+    ot.isCall        := isCall
+    ot.tag           := tag
+    ot.strike        := strike
+    ot.contracts     := contracts
+    ot.entryPrem     := entryPrem
+    ot.entryPx       := close
+    ot.riskPx        := dist
+    ot.stopPx        := stp
+    ot.targetPx      := tgt
+    ot.bestPx        := close
+    ot.entryTime     := time_close
+    ot.closedAtEntry := strategy.closedtrades
+    st.dayTrades     += 1
+    if isOrb and isCall
+        orbLongUsed := true
+    if isOrb and not isCall
+        orbShortUsed := true
+
+    if showLabels
+        string txt = "BUY " + tag + " · " + setup + "\n≈ " + f_prem(prem) + " · Δ " + str.tostring(delta, "0.00") +
+             "\nstop " + f_px(stp) + (na(tgt) ? "" : " · target " + f_px(tgt))
+        string tip = "Modeled option values (Black-Scholes, IV " + str.tostring(iv * 100.0, "0.0") + "%)\n" +
+             "Entry premium ≈ " + f_prem(prem) + "\nPremium if stop is hit ≈ " + f_prem(premStop) +
+             (na(tgt) ? "" : "\nPremium if target is hit ≈ " + f_prem(premTgt)) +
+             "\nModeled risk per contract ≈ $" + str.tostring(riskPerContract, "0")
+        label.new(bar_index, isCall ? low : high, txt,
+             style = isCall ? label.style_label_up : label.style_label_down,
+             color = isCall ? color.new(C_BULL, 10) : color.new(C_BEAR, 10),
+             textcolor = color.white, size = size.small, tooltip = tip)
+
+// ── 9. Chart ─────────────────────────────────────────────────────────────────
+plot(inRth ? vwapVal : na, "VWAP", color = color.new(C_WARN, 0), linewidth = 2, style = plot.style_linebr)
+plot(emaFast, "Fast EMA", color = color.new(color.aqua, 20))
+plot(emaSlow, "Slow EMA", color = color.new(color.purple, 20))
+plot(showLevels and orDone and inRth ? orHigh : na, "Opening range high", color = color.new(color.gray, 20), style = plot.style_linebr)
+plot(showLevels and orDone and inRth ? orLow : na, "Opening range low", color = color.new(color.gray, 20), style = plot.style_linebr)
+plot(showLevels and ot.active ? ot.stopPx : na, "Stop", color = color.new(C_BEAR, 0), linewidth = 2, style = plot.style_linebr)
+plot(showLevels and ot.active ? ot.targetPx : na, "Target", color = color.new(C_BULL, 0), linewidth = 2, style = plot.style_linebr)
+
+color shade = not showShade or not inRth ? na : closeMin >= flatMin ? color.new(C_BEAR, 92) : inEntryWin and not inLunch and dowOk ? color.new(color.blue, 95) : na
+bgcolor(shade, title = "Session shading")
+
+// ── 10. Dashboard ────────────────────────────────────────────────────────────
+if showTable and barstate.islast
+    string posId = switch tablePos
+        "Top left"     => position.top_left
+        "Bottom right" => position.bottom_right
+        "Bottom left"  => position.bottom_left
+        => position.top_right
+    var table dash = table.new(posId, 2, 10, bgcolor = color.new(chart.bg_color, 10), frame_color = color.new(chart.fg_color, 70), frame_width = 1, border_color = color.new(chart.fg_color, 90), border_width = 1)
+    color fg = chart.fg_color
+
+    string biasTxt = biasLong ? "Calls ▲" : biasShort ? "Puts ▼" : "Neutral"
+    color  biasCol = biasLong ? C_BULL : biasShort ? C_BEAR : fg
+    string ivTxt   = str.tostring(iv * 100.0, "0.0") + "%" + (ivSource == IV_MANUAL ? " (manual)" : " (index " + str.tostring(volIndex, "0.0") + " × " + str.tostring(ivMult, "0.00") + ")")
+    string posTxt  = "Flat"
+    color  posCol  = fg
+    if ot.active
+        float nowPrem = f_bsPrice(ot.isCall, close, ot.strike, tYears, iv)
+        float nowPct  = ot.entryPrem > 0.0 ? (nowPrem - ot.entryPrem) / ot.entryPrem * 100.0 : 0.0
+        posTxt := ot.tag + " ≈ " + f_prem(nowPrem) + " (" + (nowPct >= 0.0 ? "+" : "") + str.tostring(nowPct, "0") + "%)"
+        posCol := nowPct >= 0.0 ? C_BULL : C_BEAR
+    int    nTrades = st.wins + st.losses
+    string wrTxt   = nTrades > 0 ? str.tostring(100.0 * st.wins / nTrades, "0") + "% of " + str.tostring(nTrades) : "no trades yet"
+    string pfTxt   = st.grossLoss > 0.0 ? str.tostring(st.grossWin / st.grossLoss, "0.00") : "n/a"
+
+    table.cell(dash, 0, 0, "QQQ 0DTE", text_color = fg, text_halign = text.align_left, text_size = size.normal)
+    table.cell(dash, 1, 0, inRth ? str.tostring(minsLeft, "0") + " min to expiry" : "Market closed", text_color = fg, text_halign = text.align_right, text_size = size.small)
+    f_cell(dash, 1, "Bias", biasTxt, biasCol)
+    f_cell(dash, 2, "Model IV", ivTxt, fg)
+    f_cell(dash, 3, "Call " + f_strike(kCall), "≈ " + f_prem(callPrem) + " · Δ " + str.tostring(callDelta, "0.00"), fg)
+    f_cell(dash, 4, "Put " + f_strike(kPut), "≈ " + f_prem(putPrem) + " · Δ " + str.tostring(putDelta, "0.00"), fg)
+    f_cell(dash, 5, "Position", posTxt, posCol)
+    f_cell(dash, 6, "Today", str.tostring(st.dayTrades) + "/" + str.tostring(maxTrades) + " trades · " + f_usd(st.dayPnl), st.dayPnl >= 0.0 ? C_BULL : C_BEAR)
+    f_cell(dash, 7, "All trades", f_usd(st.totalPnl) + " · win " + wrTxt, st.totalPnl >= 0.0 ? C_BULL : C_BEAR)
+    f_cell(dash, 8, "Profit factor", pfTxt, fg)
+    table.cell(dash, 0, 9, syminfo.ticker == "QQQ" ? "Modeled option values, not real fills" : "Built for QQQ. Check strike spacing and IV index", text_color = syminfo.ticker == "QQQ" ? color.new(fg, 45) : C_WARN, text_halign = text.align_left, text_size = size.tiny)
+    table.merge_cells(dash, 0, 9, 1, 9)

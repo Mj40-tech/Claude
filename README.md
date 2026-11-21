@@ -1,3 +1,10 @@
+# TradingView scripts
+
+| Script | What it is |
+| --- | --- |
+| `qqq_0dte_strategy.pine` | QQQ 0DTE options day trader. Documented first, below. |
+| `ny_4am_sweep_ifvg_strategy.pine` | 4AM range sweep into a 15-minute PD array with an IFVG entry. Documented in the [second half](#4am-range-sweep--15m-pd-array--ifvg) of this page. |
+
 # QQQ 0DTE Options Day Trader (TradingView Pine Script v6)
 
 `qqq_0dte_strategy.pine` is an intraday strategy for buying same-day-expiry (0DTE) QQQ options.
@@ -100,3 +107,77 @@ The script does not place trades; you (or your own automation) act on the alert.
 - Backtest fills happen at the bar close that produced the signal. A real order fills a moment later at a slightly different price.
 - Pre-market levels need extended hours switched on for the chart.
 - Past backtest results do not predict future results. 0DTE options can lose their entire value in minutes. This is an educational tool, not financial advice.
+
+# 4AM Range Sweep + 15m PD Array + IFVG
+
+`ny_4am_sweep_ifvg_strategy.pine` automates this checklist (all times New York):
+
+| Checklist step | What the script does |
+| --- | --- |
+| Wake up at 03:55 | Sends a wake-up alert at 03:55. |
+| Mark the nearest 15-minute PD array | Draws the nearest bearish 15m array above price and the nearest bullish 15m array below price. |
+| Wait for 04:00, mark the 03:00-04:00 high and low | Draws the range box and extends its high and low as dashed lines. |
+| Wait for a sweep of the high or low into a marked array | Labels the sweep, then labels the moment price trades into a marked array. |
+| Enter after the first 30-second IFVG | Enters at the close of the first bar that inverts a fair value gap on the chart timeframe. |
+| Target opposing liquidity, max 1:3 RR | Stop beyond the sweep extreme. Target at the other side of the range, moved in to 3R if the range is further away. |
+
+## Install
+
+1. Open a chart of a market that trades overnight (futures such as NQ or ES, forex, gold, crypto) and set it to **30 seconds**.
+2. Open the **Pine Editor**, paste the contents of `ny_4am_sweep_ifvg_strategy.pine`, and click **Add to chart**.
+3. The **Strategy Tester** tab shows the backtest. The status table on the chart shows which step of the checklist today is on.
+
+Second-based charts need a TradingView plan that includes them. On a 1-minute chart the script still runs, and the
+entry IFVG is then a 1-minute one. US stocks and ETFs have no bars between 03:00 and 04:00, so the script has nothing to
+work with there.
+
+## How each step is defined
+
+- **15m PD array:** a fair value gap, an order block or an inverse fair value gap on the 15-minute chart that no
+  15-minute candle has closed through. Each type has its own switch. Only arrays from closed 15m candles are used, so
+  a marked array never changes after the fact.
+- **Nearest:** at 03:55 the script takes the closest bearish array above price and the closest bullish array below
+  price. With **Skip arrays that sit inside the range** on (the default), an array has to reach beyond the range so
+  far, because a sweep of the range cannot end inside an array that is inside the range.
+- **Sweep:** after 04:00 a bar trades beyond the range high or low.
+- **Into the array:** from the sweep bar on, a bar overlaps a marked array that is still valid. A marked array stops
+  being valid when a 15m candle closes through it.
+- **IFVG:** for a short, a bar closes below a bullish fair value gap on the chart timeframe. For a long, a bar closes
+  above a bearish one. The gap must have formed within the last 60 bars.
+- **One trade a day.** The first side to complete every step is the trade.
+
+## Choices the checklist leaves open
+
+These are the script's defaults. Each one is a setting.
+
+| Question | Default |
+| --- | --- |
+| When does the script stop looking for an entry? | 07:00 New York |
+| Where is the stop? | One tick beyond the highest (short) or lowest (long) price of the sweep |
+| What if the other side of the range is very close? | The trade is skipped when the target is less than 1R away |
+| How many arrays are marked? | One above price and one below |
+| Is an open trade closed at a set time? | No. It stays open until the stop or the target is hit |
+| Position size | 1 contract or unit. Risk-based sizing is available |
+
+## Alerts
+
+Create an alert on the strategy, choose **Order fills and alert() function calls**, and set the message to:
+
+```
+{{strategy.order.alert_message}}
+```
+
+You then get the 03:55 wake-up with the marked arrays, the 04:00 range, the sweep into an array, and the entry and exit
+with prices. The script runs when a bar closes, so each alert arrives at the close of the bar that caused it.
+
+## Limits
+
+- The script was checked by review, not by TradingView's compiler, which was not reachable where it was written. If the
+  Pine Editor reports an error when you add it to the chart, the error message and line number are enough to fix it.
+- A 30-second chart loads about a week of history on most plans, so the backtest covers only a handful of trades.
+  That is too few to judge the model. Use bar replay to study more days.
+- Order blocks have no single agreed definition. The script uses the last opposite candle before a candle that closes
+  beyond it. Switch order blocks off if your definition differs.
+- Backtest entries fill at the close of the bar that inverts the gap. A live order fills a moment later at a slightly
+  different price.
+- Past backtest results do not predict future results. This is an educational tool, not financial advice.
